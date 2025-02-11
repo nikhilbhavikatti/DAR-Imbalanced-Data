@@ -10,6 +10,7 @@ import os
 from tqdm.auto import tqdm
 import json
 import seaborn as sns
+import copy
 
 def plot_accuracy(checkpoints, train_accuracies, val_accuracies, test_accuracies, model_name, save_path):
     """
@@ -247,7 +248,7 @@ val_loader = DataLoader(val_dataset, batch_size=16, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=16, shuffle=True)
 learning_rates = [1e-2, 1e-3, 1e-4]
 
-num_epochs = 50
+num_epochs = 3
 checkpoint_interval = 1
 
 # Create a directory to save checkpoints
@@ -257,10 +258,14 @@ os.makedirs("checkpoints", exist_ok=True)
 os.makedirs("plots_new", exist_ok=True)
 save_dir = "plots_new"
 
+train_accuracies_dict_orig = {}
+val_accuracies_dict_orig = {}
+test_accuracies_dict_orig = {}
+final_accuracies_val_orig = []
+final_accuracies_test_orig = []
 train_accuracies_dict = {}
 val_accuracies_dict = {}
 test_accuracies_dict = {}
-final_accuracies = []
 final_accuracies_val = []
 final_accuracies_test = []
 models_trained = []
@@ -270,27 +275,38 @@ for criterion in criteria:
     for loader_name, dataloader in dataloaders.items():
         for lr in learning_rates:
             model_name = f"{loader_name}_{criterion.__class__.__name__.lower()}_{lr:.0e}"
+            train_accuracies_orig = []
+            val_accuracies_orig = []
+            test_accuracies_orig = []
             train_accuracies = []
             val_accuracies = []
             test_accuracies = []
             # Reinitialize the model
-            model = pretrained_model.to(device)
+            model = copy.deepcopy(pretrained_model).to(device)
             model.classifier = nn.Linear(128, num_classes).to(device)
             optimizer = optim.Adam(model.parameters(), lr=lr)
 
             # Initialize variables to track the best validation accuracy
+            best_val_accuracy_orig = 0.0
+            best_test_accuracy_orig = 0.0
             best_val_accuracy = 0.0
             best_test_accuracy = 0.0
-
             # for epoch in epoch_progress:
             for epoch in range(num_epochs):
                 model.train()
                 running_loss = 0.0
                 correct_train = 0
                 total_train = 0
-                
                 # when using full model
                 train_progress = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
+                
+                # mean accuracy for epoch
+                class_correct_train = torch.zeros(num_classes).to(device)
+                class_total_train = torch.zeros(num_classes).to(device)
+                class_correct_val = torch.zeros(num_classes).to(device)
+                class_total_val = torch.zeros(num_classes).to(device)
+                class_correct_test = torch.zeros(num_classes).to(device)
+                class_total_test = torch.zeros(num_classes).to(device)
 
                 for batch_idx, batch in enumerate(train_progress):
                     frames, _, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
@@ -307,15 +323,23 @@ for criterion in criteria:
                     correct_train += (preds == labels).sum().item()
                     total_train += labels.size(0)
 
+                    for c in range(num_classes):
+                        class_mask = (labels == c)
+                        class_correct_train[c] += (preds[class_mask] == labels[class_mask]).sum().item()
+                        class_total_train[c] += class_mask.sum().item()
+                        
                     # Update the progress bar with batch-specific details
-                    avg_loss = running_loss / (batch_idx + 1)
+                    avg_loss = running_loss / (batch_idx+1)
+                    per_class_accuracy_train = (class_correct_train / class_total_train).cpu().numpy()
+                    train_accuracy = np.mean(per_class_accuracy_train)
                     train_progress.set_postfix(
                         batch=batch_idx + 1,
                         loss=f"{loss.item():.4f}",
-                        avg_loss=f"{avg_loss:.4f}"
+                        avg_loss=f"{avg_loss:.4f}",
+                        train_accuracy=f"{train_accuracy*100:.2f}%",
                     )
-
-                train_accuracy = correct_train / total_train
+                train_accuracy_orig = correct_train / total_train
+                train_accuracies_orig.append(train_accuracy_orig * 100)
                 train_accuracies.append(train_accuracy * 100)
 
                 # Validation phase
@@ -323,7 +347,6 @@ for criterion in criteria:
                 correct_val = 0
                 total_val = 0
                 y_true, y_pred = [], []
-
                 with torch.no_grad():
                     for batch in val_loader:
                         frames, _, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
@@ -333,15 +356,22 @@ for criterion in criteria:
                         total_val += labels.size(0)
                         y_true.extend(labels.cpu().numpy())
                         y_pred.extend(preds.cpu().numpy())
+                        
+                        for c in range(num_classes):
+                            class_mask = (labels == c)
+                            class_correct_val[c] += (preds[class_mask] == labels[class_mask]).sum().item()
+                            class_total_val[c] += class_mask.sum().item()
 
-                val_accuracy = correct_val / total_val
+                per_class_accuracy_val = (class_correct_val / class_total_val).cpu().numpy()
+                val_accuracy = np.mean(per_class_accuracy_val)
+                val_accuracy_orig = correct_val / total_val
+                val_accuracies_orig.append(val_accuracy_orig * 100)
                 val_accuracies.append(val_accuracy * 100)
 
                 # Test phase
                 correct_test = 0
                 total_test = 0
                 y_test_true, y_test_pred = [], []
-
                 with torch.no_grad():
                     for batch in test_loader:
                         frames, _, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
@@ -351,8 +381,15 @@ for criterion in criteria:
                         total_test += labels.size(0)
                         y_test_true.extend(labels.cpu().numpy())
                         y_test_pred.extend(preds.cpu().numpy())
+                        for c in range(num_classes):
+                            class_mask = (labels == c)
+                            class_correct_test[c] += (preds[class_mask] == labels[class_mask]).sum().item()
+                            class_total_test[c] += class_mask.sum().item()
 
-                test_accuracy = correct_test / total_test
+                per_class_accuracy_test = (class_correct_test / class_total_test).cpu().numpy()
+                test_accuracy = np.mean(per_class_accuracy_test)
+                test_accuracy_orig = correct_test / total_test
+                test_accuracies_orig.append(test_accuracy_orig * 100)
                 test_accuracies.append(test_accuracy * 100)
 
                 # Save the model checkpoint every 200 epochs
@@ -363,6 +400,16 @@ for criterion in criteria:
                     print(f"Checkpoint saved: {checkpoint_path}")
 
                 # Save the best model based on validation accuracy
+                if val_accuracy_orig > best_val_accuracy_orig:
+                    best_y_true_orig = y_true
+                    best_y_pred_orig = y_pred
+                    best_val_accuracy_orig = val_accuracy_orig
+                    best_orig_model_name = f"best_original_{loader_name}_{criterion.__class__.__name__.lower()}_{lr:.0e}.pth"
+                    best_orig_model_path = os.path.join("checkpoints", best_orig_model_name)
+                    torch.save(model.state_dict(), best_orig_model_path)
+                    print(f"Best model saved: {best_orig_model_path}")
+
+                # Save the best model based on validation accuracy
                 if val_accuracy > best_val_accuracy:
                     best_y_true = y_true
                     best_y_pred = y_pred
@@ -371,22 +418,33 @@ for criterion in criteria:
                     best_model_path = os.path.join("checkpoints", best_model_name)
                     torch.save(model.state_dict(), best_model_path)
                     print(f"Best model saved: {best_model_path}")
-
+                    
                 # Save the best model based on test accuracy
+                if test_accuracy_orig > best_test_accuracy_orig:
+                    best_test_accuracy_orig = test_accuracy_orig
                 if test_accuracy > best_test_accuracy:
                     best_test_accuracy = test_accuracy
-
+            train_accuracies_dict_orig[model_name] = train_accuracies_orig
+            val_accuracies_dict_orig[model_name] = val_accuracies_orig
+            test_accuracies_dict_orig[model_name] = test_accuracies_orig
+            final_accuracies_val_orig.append(best_val_accuracy_orig * 100)
+            final_accuracies_test_orig.append(best_test_accuracy_orig * 100)
             train_accuracies_dict[model_name] = train_accuracies
             val_accuracies_dict[model_name] = val_accuracies
             test_accuracies_dict[model_name] = test_accuracies
             final_accuracies_val.append(best_val_accuracy * 100)
             final_accuracies_test.append(best_test_accuracy * 100)
             models_trained.append(model_name)
-            plot_confusion_matrix(best_y_true, best_y_pred, model_name, list(activity_to_label.keys()), "plots_new")
+            plot_confusion_matrix(best_y_true_orig, best_y_pred_orig, model_name, list(activity_to_label.keys()), "plots_new")
 
             print(f"Training completed for {loader_name} with {criterion.__class__.__name__} and lr={lr}")
 
 # Save all accuracies as NumPy arrays
+np.save(os.path.join(save_dir, "train_accuracies_orig.npy"), train_accuracies_dict_orig)
+np.save(os.path.join(save_dir, "val_accuracies_orig.npy"), val_accuracies_dict_orig)
+np.save(os.path.join(save_dir, "test_accuracies_orig.npy"), test_accuracies_dict_orig)
+np.save(os.path.join(save_dir, "final_accuracies_val_orig.npy"), final_accuracies_val_orig)
+np.save(os.path.join(save_dir, "final_accuracies_test_orig.npy"), final_accuracies_test_orig)
 np.save(os.path.join(save_dir, "train_accuracies.npy"), train_accuracies_dict)
 np.save(os.path.join(save_dir, "val_accuracies.npy"), val_accuracies_dict)
 np.save(os.path.join(save_dir, "test_accuracies.npy"), test_accuracies_dict)
